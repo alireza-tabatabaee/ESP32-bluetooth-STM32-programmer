@@ -28,9 +28,6 @@
 
 static const esp_spp_mode_t esp_spp_mode = ESP_SPP_MODE_CB;
 
-// static struct timeval time_new, time_old;
-// static long data_num = 0;
-
 // state machine. 0 = waiting for connection 
     // 1 - waiting to recieve length
     // 2 - recieving data
@@ -38,6 +35,11 @@ uint8_t progState = 0;
 
 static const esp_spp_sec_t sec_mask = ESP_SPP_SEC_AUTHENTICATE;
 static const esp_spp_role_t role_slave = ESP_SPP_ROLE_SLAVE;
+
+#define RX_PIN      16
+#define TX_PIN      17
+
+void memWriteTask(void* pvParams);
 
 static char *bda2str(uint8_t * bda, char *str, size_t size)
 {
@@ -58,30 +60,52 @@ char buf[5][256];
 TaskHandle_t parseTaskHandle;
 QueueHandle_t packetQueue;
 
-void eraseFlash()
+typedef struct {
+    uint16_t len;
+    uint8_t data[255];
+} datastruct;
+
+/*
+    Sends the flash erase command to the STM32 MCU
+*/
+uint8_t eraseFlash(void)
 {
-    //uint8_t hddt[2] = {0x43, 0xBC};
-    uint8_t hddt[2] = {0x44, 0xBB};
-    uart_write_bytes(UART_NUM_1, &hddt, 2);
+    //uint8_t hddt[2] = {0x44, 0xBB};
+    //uart_write_bytes(UART_NUM_1, &hddt, 2);
+    uint8_t hddt1 = 0x44;
+    uint8_t hddt2 = 0xBB;
+    uart_write_bytes(UART_NUM_1, &hddt1, 1);
+    vTaskDelay(1);
+    uart_write_bytes(UART_NUM_1, &hddt2, 1);
     uint8_t ackstat = 0;
-    uart_read_bytes(UART_NUM_1, &ackstat, 1, 2000);
+    uart_read_bytes(UART_NUM_1, &ackstat, 1, 2000/portTICK_RATE_MS);
     ESP_LOGW("EXERACK", "%d", ackstat);
     if(ackstat==0x79)
     {
         uint8_t masserase [3] = {0xFF, 0xFF, 0x00};
         uart_write_bytes(UART_NUM_1, &masserase, 3);
     }
-    uart_read_bytes(UART_NUM_1, &ackstat, 1, 2000);
+    else
+        return 2;
+    ackstat = 0; 
+    uart_read_bytes(UART_NUM_1, &ackstat, 1, 20000/portTICK_RATE_MS);
     ESP_LOGW("ERASEMASS", "%d", ackstat);
+    return ackstat;
 }
 
-uint32_t flashadd = 0x08000000;
-void writeToMem(uint8_t len, uint8_t bufId)
+uint32_t flashadd = 0x08000000; // Start address of flash memory in STM32 
+
+/*
+    Writes N bytes of data to the STM32 flash memory via UART (See AN for protocol's details)
+    @param len: length of data to be written
+    @param src: pointer to the source of data to be written
+*/
+void writeToMem(uint16_t len, uint8_t* src)
 {
     uint8_t hddt[2] = {0x31, 0xCE};
     uart_write_bytes(UART_NUM_1, &hddt, 2);
     uint8_t ackstat = 0;
-    uart_read_bytes(UART_NUM_1, &ackstat, 1, 2000);
+    uart_read_bytes(UART_NUM_1, &ackstat, 1, 5000/portTICK_RATE_MS);
     ESP_LOGW("WR1", "%d", ackstat);
     if(ackstat==0x79)
     {
@@ -93,57 +117,37 @@ void writeToMem(uint8_t len, uint8_t bufId)
         flashaddbytes[3] = (flashadd&0x000000FF);
         flashaddbytes[4] = (flashaddbytes[0]^flashaddbytes[1]^flashaddbytes[2]^flashaddbytes[3]);
         uart_write_bytes(UART_NUM_1, flashaddbytes, 5);
-        uart_read_bytes(UART_NUM_1, &ackstat, 1, 2000);
+        uart_read_bytes(UART_NUM_1, &ackstat, 1, 2000/portTICK_RATE_MS);
         ESP_LOGW("WR2", "%d", ackstat);
         if(ackstat==0x79)
         {
             ackstat = 0;
-            uint8_t len1 = len;// - 1;
+            uint16_t len1 = len - 1;
             uint8_t checksumf = len1;
-            for(int i=0; i<len+1; i++)
-                checksumf ^= buf[bufId][i];
+            for(uint16_t i=0; i<len; i++)
+                checksumf ^= src[i];
             uart_write_bytes(UART_NUM_1, &len1, 1);
-            uart_write_bytes(UART_NUM_1, buf[bufId], len+1);
+
+            uart_write_bytes(UART_NUM_1, src, len);
             uart_write_bytes(UART_NUM_1, &checksumf, 1);
-            uart_read_bytes (UART_NUM_1, &ackstat, 1, 2000);
+            uart_read_bytes (UART_NUM_1, &ackstat, 1, 8000/portTICK_RATE_MS);
             ESP_LOGW("WR3", "%d", ackstat);
             if(ackstat==0x79){
-                flashadd += ((uint32_t)len+1);
-                esp_spp_write(gHandle, 7, (uint8_t*)"DATSENT");
+                flashadd += ((uint32_t)len);
+                esp_spp_write(gHandle, 4, (uint8_t*)"ACK1");
                 ESP_LOGW("FL", "FL: %#X", flashadd);
             }
             else
-                esp_spp_write(gHandle, 5, (uint8_t*)"ERRW3");
+                esp_spp_write(gHandle, 4, (uint8_t*)"ERW3");
         }
         else
-            esp_spp_write(gHandle, 5, (uint8_t*)"ERRW2");
+            esp_spp_write(gHandle, 4, (uint8_t*)"ERW2");
     }
     else
-        esp_spp_write(gHandle, 5,(uint8_t*) "ERRW1");
+        esp_spp_write(gHandle, 4,(uint8_t*) "ERW1");
 }
 
-void parseTask(void* inp)
-{
-    ESP_LOGW("Q", "startpars success");
-    while(1)
-    {
-        uint32_t notificationvalue = ulTaskNotifyTake( pdTRUE, 100 );
-        if(notificationvalue==2 && uxQueueMessagesWaiting(packetQueue)==0)
-        {
-            ESP_LOGW("Q", "parse task bye!!!");
-            vTaskDelete(NULL);
-        } 
-        else {
-            uint8_t len, parseid;
-            xQueueReceive(packetQueue, &len, 3000);
-            xQueueReceive(packetQueue, &parseid, 3000);
-            writeToMem(len, parseid);
-            ESP_LOGW("QA", "%d bytes", len);
-            ESP_LOGW("QA", "%s", buf[parseid] );
-        }
-    }
-}
-
+uint8_t eraseflag = 0;
 static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 {
     char bda_str[18] = {0};
@@ -180,71 +184,39 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
     case ESP_SPP_CL_INIT_EVT:
         ESP_LOGI(SPP_TAG, "ESP_SPP_CL_INIT_EVT");
         break;
+
     // data input event
     case ESP_SPP_DATA_IND_EVT:
 
         ESP_LOGI(SPP_TAG, "ESP_SPP_DATA_IND_EVT len:%d handle:%d",
                  param->data_ind.len, param->data_ind.handle);
-        if(strcmp((char*)param->data_ind.data, "RES")==0)
-            progState = 0;
-        else if(progState == 0)
+        
+        if(strcmp((char*)param->data_ind.data, "INIT")==0)
         {
-            if(strcmp((char*)param->data_ind.data, "`INIT")==0)
+            uint8_t initbyte = 0X7F;
+            uint8_t ackstat = 0;
+            uart_write_bytes(UART_NUM_1, &initbyte, 1);
+            uart_read_bytes(UART_NUM_1, &ackstat, 1, 1000/portTICK_RATE_MS);
+            if(ackstat == 0x79)
             {
-                // reset the STM32 MCU by sending a negative pulse on the NRST pin
-                gpio_set_level(GPIO_NUM_5, 0);
-                vTaskDelay(25);
-                gpio_set_level(GPIO_NUM_5, 1);
-                vTaskDelay(10);
-                // send 0x7F to begin communication with the System Memory bootloader
-                uint8_t n7f = 0x7F;
-                uart_write_bytes(UART_NUM_1, &n7f, 1);             
-                uart_read_bytes(UART_NUM_1, &n7f, 1, 2000);
-                if(n7f == 0x79){
-                    // create the task that sends the flashing data over UART
-                    BaseType_t ret = xTaskCreate(parseTask, "Parsing info and sending w UART", 2048, NULL, 0, &parseTaskHandle);
-                    if(ret!=pdPASS)
-                        ESP_LOGW("Q", "TaskCreFail");
-                    else
-                        ESP_LOGW("Q", "Task creat");
-                    esp_spp_write(gHandle, 4, (uint8_t*)"ACK0");
-                    progState = 1;
-                    eraseFlash();
-                }
-                else
-                   esp_spp_write(gHandle, 1, &n7f); 
+                eraseflag = 1; //Perhaps eraseflag immediately jumps to the other task and that's why
             }
             else
-                esp_spp_write(gHandle, 5, (uint8_t*)"ERRHE");
+                esp_spp_write(gHandle, 4, (uint8_t*)"NCON");    // not connected, init failed
         }
-        else if(progState==1)
+        else if(progState == 1 && strcmp((char*)param->data_ind.data, "FINI")==0)
         {
-            if (strcmp((char*)param->data_ind.data, "`FINI"))
-            {
-                dataLen = atoi((char*)param->data_ind.data);
-                if(dataLen>0 && dataLen<=256)
-                {
-                    xQueueSend(packetQueue, &dataLen, 3000);
-                    esp_spp_write(gHandle, 4, (uint8_t*)"ACK1");
-                    progState = 2;
-                }
-                else
-                esp_spp_write(gHandle, 5, (uint8_t*)"ERRLN"); 
-            }
-            else { // End of transmission
-                xTaskNotify(parseTaskHandle, 2, eSetValueWithOverwrite);
-                progState = 0;
-            }
+            flashadd = 0x08000000;
+            esp_spp_write(gHandle, 4, (uint8_t*)"ACK2");
+            progState = 0;
         }
-        else if(progState == 2)
+        else if(progState == 1)
         {
-            if (bufPtr == 5) bufPtr = 0;
-            strcpy(buf[bufPtr] , (char*)param->data_ind.data);
-            xQueueSend(packetQueue, &bufPtr, 3000);
-            bufPtr++;
-            dataLen = 0;
-            progState = 1;                
-        }    
+            datastruct dsg;
+            dsg.len = param->data_ind.len;
+            memcpy(dsg.data, param->data_ind.data, dsg.len);
+            xQueueSend(packetQueue, &dsg, 1000/portTICK_RATE_MS);
+        }
 
         break;
     case ESP_SPP_CONG_EVT:
@@ -373,15 +345,46 @@ void app_main(void)
 
     ESP_LOGI(SPP_TAG, "Own address:[%s]", bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));
 
-    gpio_config_t gconf = {.pin_bit_mask=1<<5, .mode=GPIO_MODE_OUTPUT, .pull_up_en=GPIO_PULLUP_DISABLE, .pull_down_en=GPIO_PULLDOWN_DISABLE,
+
+    /*gpio_config_t gconf = {.pin_bit_mask=1<<5, .mode=GPIO_MODE_OUTPUT, .pull_up_en=GPIO_PULLUP_DISABLE, .pull_down_en=GPIO_PULLDOWN_DISABLE,
         .intr_type=GPIO_INTR_DISABLE,};
     gpio_config(&gconf);
-    gpio_set_level(GPIO_NUM_5, 1);
+    gpio_set_level(GPIO_NUM_5, 1);*/
+    // Setting up the UART for the communication between ESP32 and STM32
     uart_config_t uconf = {.baud_rate = 38400, .data_bits= UART_DATA_8_BITS, .parity = UART_PARITY_EVEN, .stop_bits=UART_STOP_BITS_1,
         .flow_ctrl=UART_HW_FLOWCTRL_DISABLE, .rx_flow_ctrl_thresh = 1,};
     uart_param_config(UART_NUM_1,&uconf);
-    uart_set_pin(UART_NUM_1, 17, 16, 18, 19); //TX, RX, CTS, RTS
-    uart_driver_install(UART_NUM_1,260,260,2,NULL,0);
+    uart_set_pin(UART_NUM_1, TX_PIN, RX_PIN, 18, 19); //TX pin , RX pin, CTS, RTS
+    uart_driver_install(UART_NUM_1, 260, 260, 2, NULL, 0);
 
-    packetQueue = xQueueCreate(10, sizeof(uint8_t));
+    packetQueue = xQueueCreate(4, sizeof(datastruct));
+
+    xTaskCreate(memWriteTask, "STM32 flash write task", 4096, NULL, 1, NULL);
+}
+
+void memWriteTask(void* pvParams)
+{
+    datastruct datas;
+    while(1)
+    {
+        ESP_LOGI("Mall", "%s", "h");
+        if(xQueueReceive(packetQueue, &datas, 1000/portTICK_RATE_MS))
+        {
+            writeToMem(datas.len, datas.data);
+        }
+        else if(eraseflag)
+        {
+            uint8_t erres = eraseFlash();
+            if( erres == 0x79 )
+            {
+                esp_spp_write(gHandle, 4, (uint8_t*)"ACK0");
+                progState = 1;
+            }
+            else
+                esp_spp_write(gHandle, 4, (uint8_t*)"ERFA");    // erase failed
+            eraseflag = 0;
+        }
+        else
+            vTaskDelay(1000/portTICK_RATE_MS);
+    }
 }
